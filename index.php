@@ -52,6 +52,15 @@ if ($view === 'logout') {
 if ($pdo && empty($_SESSION['user_id']) && $_SERVER['REQUEST_METHOD'] !== 'POST') {
     $view = 'login';
 }
+if (
+    !empty($_SESSION['user_id']) &&
+    ($_SESSION['user_role'] ?? '') === 'Cliente' &&
+    $_SERVER['REQUEST_METHOD'] !== 'POST' &&
+    !in_array($view, ['agenda', 'appointment-new', 'logout'], true)
+) {
+    redirectTo('agenda');
+}
+$isCustomer = ($_SESSION['user_role'] ?? '') === 'Cliente';
 
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
@@ -76,7 +85,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $statement = $pdo->prepare(
                 "SELECT id_usuario, nombre, rol, password
                  FROM usuarios
-                 WHERE correo = :correo AND rol IN ('Administrador', 'Barbero')
+                 WHERE correo = :correo
                  LIMIT 1"
             );
             $statement->execute(['correo' => $email]);
@@ -89,7 +98,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['user_name'] = $user['nombre'];
             $_SESSION['user_role'] = $user['rol'];
             $_SESSION['flash'] = ['type' => 'success', 'text' => 'Sesión iniciada. Bienvenido a BeardShop.'];
-            redirectTo('dashboard');
+            redirectTo($user['rol'] === 'Cliente' ? 'agenda' : 'dashboard');
+        }
+        if ($isCustomer && !in_array($action, ['create-appointment', 'cancel-customer-appointment'], true)) {
+            throw new RuntimeException('Tu cuenta de cliente solo puede gestionar sus propias citas.');
         }
 
         if ($action === 'create-client') {
@@ -137,7 +149,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($action === 'create-appointment') {
-            $clientId = filter_var($_POST['id_cliente'] ?? null, FILTER_VALIDATE_INT);
+            $clientId = $isCustomer
+                ? filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT)
+                : filter_var($_POST['id_cliente'] ?? null, FILTER_VALIDATE_INT);
             $barberId = filter_var($_POST['id_barbero'] ?? null, FILTER_VALIDATE_INT);
             $serviceId = filter_var($_POST['id_servicio'] ?? null, FILTER_VALIDATE_INT);
             $dateTime = DateTime::createFromFormat('Y-m-d\TH:i', (string) ($_POST['fecha_hora'] ?? ''));
@@ -147,9 +161,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (
                 !$clientId || !$barberId || !$serviceId || !$dateTime ||
                 $hasDateErrors ||
+                $dateTime->format('i') !== '00' ||
+                (int) $dateTime->format('G') < 9 ||
+                (int) $dateTime->format('G') >= 18 ||
                 $dateTime->getTimestamp() < time()
             ) {
-                throw new RuntimeException('Selecciona el cliente, servicio, barbero y un horario futuro.');
+                throw new RuntimeException('Elige el cliente, servicio y barbero, y una hora en punto entre las 9:00 a. m. y las 5:00 p. m.');
             }
 
             $clientCheck = $pdo->prepare("SELECT id_usuario FROM usuarios WHERE id_usuario = :id AND rol = 'Cliente'");
@@ -170,10 +187,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $start = $dateTime->format('Y-m-d H:i:s');
             $end = (clone $dateTime)->modify('+' . (int) $service['duracion_minutos'] . ' minutes')->format('Y-m-d H:i:s');
+            if ($end > $dateTime->format('Y-m-d') . ' 18:00:00') {
+                throw new RuntimeException('La cita debe terminar antes de las 6:00 p. m.');
+            }
             $overlapCheck = $pdo->prepare(
                 "SELECT c.id_cita
                  FROM citas c
-                 JOIN (
+                 LEFT JOIN (
                     SELECT cs.id_cita, SUM(s.duracion_minutos) AS duracion
                     FROM cita_servicios cs
                     JOIN servicios s ON s.id_servicio = cs.id_servicio
@@ -182,7 +202,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  WHERE c.id_barbero = :barbero
                    AND c.estado_cita <> 'Cancelada'
                    AND c.fecha_hora < :fin
-                   AND DATE_ADD(c.fecha_hora, INTERVAL duracion_cita.duracion MINUTE) > :inicio
+                   AND DATE_ADD(c.fecha_hora, INTERVAL COALESCE(duracion_cita.duracion, 60) MINUTE) > :inicio
                  LIMIT 1"
             );
             $overlapCheck->execute(['barbero' => $barberId, 'fin' => $end, 'inicio' => $start]);
@@ -215,7 +235,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirectTo('agenda');
         }
 
+        if ($action === 'cancel-customer-appointment') {
+            if (!$isCustomer) {
+                throw new RuntimeException('Esta acción está disponible únicamente para el cliente de la cita.');
+            }
+            $appointmentId = filter_var($_POST['id_cita'] ?? null, FILTER_VALIDATE_INT);
+            if (!$appointmentId) {
+                throw new RuntimeException('No se pudo identificar la cita que quieres cancelar.');
+            }
+            $statement = $pdo->prepare(
+                "UPDATE citas
+                 SET estado_cita = 'Cancelada'
+                 WHERE id_cita = :cita
+                   AND id_cliente = :cliente
+                   AND estado_cita NOT IN ('Completada', 'Cancelada')
+                   AND fecha_hora > DATE_ADD(NOW(), INTERVAL 48 HOUR)"
+            );
+            $statement->execute([
+                'cita' => $appointmentId,
+                'cliente' => (int) $_SESSION['user_id'],
+            ]);
+            if ($statement->rowCount() !== 1) {
+                throw new RuntimeException('Solo puedes cancelar tus citas pendientes con más de 48 horas de anticipación.');
+            }
+            $_SESSION['flash'] = ['type' => 'success', 'text' => 'Tu cita fue cancelada.'];
+            redirectTo('agenda');
+        }
+
         if ($action === 'update-appointment') {
+            if ($isCustomer) {
+                throw new RuntimeException('Los clientes no pueden cambiar directamente el estado de las citas.');
+            }
             $appointmentId = filter_var($_POST['id_cita'] ?? null, FILTER_VALIDATE_INT);
             $status = (string) ($_POST['estado_cita'] ?? '');
             if (!$appointmentId || !in_array($status, ['Confirmada', 'Completada', 'Cancelada'], true)) {
@@ -291,6 +341,7 @@ $appointments = [
     ['id_cita' => 2, 'fecha_hora' => $today . ' 10:30:00', 'estado_cita' => 'Confirmada', 'cliente' => 'Pablo García', 'telefono' => '622 456 789', 'barbero' => 'Lucas Vidal', 'servicio' => 'Corte clásico', 'duracion' => 30, 'total' => 25000],
     ['id_cita' => 3, 'fecha_hora' => $today . ' 11:00:00', 'estado_cita' => 'Pendiente', 'cliente' => 'Javier Torres', 'telefono' => '633 567 890', 'barbero' => 'Diego Ruiz', 'servicio' => 'Ritual de barba', 'duracion' => 25, 'total' => 20000],
 ];
+$bookingAvailability = [];
 $revenueByService = [
     ['nombre_servicio' => 'Corte clásico', 'total' => 1320000],
     ['nombre_servicio' => 'Corte + barba', 'total' => 960000],
@@ -324,7 +375,8 @@ if ($pdo) {
          GROUP BY b.id_barbero, u.nombre, b.especialidad, b.estado
          ORDER BY u.nombre"
     )->fetchAll();
-    $appointments = $pdo->query(
+    $appointmentScope = $isCustomer ? 'WHERE c.id_cliente = :cliente' : '';
+    $appointmentStatement = $pdo->prepare(
         "SELECT c.id_cita, c.fecha_hora, c.estado_cita, u.nombre AS cliente,
                 u.telefono, ub.nombre AS barbero,
                 COALESCE(GROUP_CONCAT(s.nombre_servicio ORDER BY s.nombre_servicio SEPARATOR ' + '), 'Servicio por definir') AS servicio,
@@ -336,10 +388,25 @@ if ($pdo) {
          JOIN usuarios ub ON ub.id_usuario = b.id_usuario
          LEFT JOIN cita_servicios cs ON cs.id_cita = c.id_cita
          LEFT JOIN servicios s ON s.id_servicio = cs.id_servicio
+         $appointmentScope
          GROUP BY c.id_cita, c.fecha_hora, c.estado_cita, u.nombre, u.telefono, ub.nombre
          ORDER BY c.fecha_hora DESC
          LIMIT 200"
-    )->fetchAll();
+    );
+    $appointmentStatement->execute($isCustomer ? ['cliente' => (int) $_SESSION['user_id']] : []);
+    $appointments = $appointmentStatement->fetchAll();
+    if ($view === 'appointment-new') {
+        $bookingAvailability = $pdo->query(
+            "SELECT c.id_barbero, c.fecha_hora,
+                    COALESCE(SUM(s.duracion_minutos), 60) AS duracion
+             FROM citas c
+             LEFT JOIN cita_servicios cs ON cs.id_cita = c.id_cita
+             LEFT JOIN servicios s ON s.id_servicio = cs.id_servicio
+             WHERE c.estado_cita <> 'Cancelada'
+               AND c.fecha_hora >= NOW()
+             GROUP BY c.id_cita, c.id_barbero, c.fecha_hora"
+        )->fetchAll();
+    }
     $summary = $pdo->query(
         "SELECT
             (SELECT COUNT(*) FROM citas WHERE DATE(fecha_hora) = CURDATE() AND estado_cita <> 'Cancelada') AS citas_hoy,
@@ -393,14 +460,19 @@ $pageNames = [
     'not-found' => 'Página no encontrada',
 ];
 $currentPageName = $pageNames[$view] ?? 'Resumen';
-$navigation = [
-    ['dashboard', 'Resumen', 'grid'],
-    ['agenda', 'Agenda', 'calendar'],
-    ['clients', 'Clientes', 'users'],
-    ['services', 'Servicios', 'scissors'],
-    ['team', 'Equipo', 'person'],
-    ['reports', 'Reportes', 'chart'],
-];
+$navigation = $isCustomer
+    ? [
+        ['agenda', 'Mis citas', 'calendar'],
+        ['appointment-new', 'Nueva cita', 'calendar'],
+    ]
+    : [
+        ['dashboard', 'Resumen', 'grid'],
+        ['agenda', 'Agenda', 'calendar'],
+        ['clients', 'Clientes', 'users'],
+        ['services', 'Servicios', 'scissors'],
+        ['team', 'Equipo', 'person'],
+        ['reports', 'Reportes', 'chart'],
+    ];
 $maxServiceRevenue = max(1, ...array_map(static function ($service) {
     return (float) $service['total'];
 }, $revenueByService));
@@ -453,17 +525,19 @@ $maxServiceRevenue = max(1, ...array_map(static function ($service) {
             <p class="side-label">GESTIÓN DEL NEGOCIO</p>
             <nav class="side-nav" aria-label="Navegación principal">
                 <?php foreach ($navigation as [$route, $label, $symbol]): ?>
-                    <?php $isActive = $view === $route || $route === 'agenda' && $view === 'appointment-new'; ?>
+                    <?php $isActive = $view === $route || (!$isCustomer && $route === 'agenda' && $view === 'appointment-new'); ?>
                     <a class="nav-link <?= $isActive ? 'active' : '' ?>"
                        href="index.php?view=<?= h($route) ?>">
                         <span class="nav-icon"><?= icon($symbol) ?></span><span><?= h($label) ?></span>
-                        <?php if ($route === 'agenda' && $metrics['appointments']): ?><small><?= (int) $metrics['appointments'] ?></small><?php endif; ?>
+                        <?php if (!$isCustomer && $route === 'agenda' && $metrics['appointments']): ?><small><?= (int) $metrics['appointments'] ?></small><?php endif; ?>
                     </a>
                 <?php endforeach; ?>
             </nav>
             <div class="side-bottom">
-                <a class="nav-link <?= $view === 'settings' ? 'active' : '' ?>" href="index.php?view=settings"><span class="nav-icon"><?= icon('settings') ?></span><span>Configuración</span></a>
-                <a class="nav-link <?= $view === 'help' ? 'active' : '' ?>" href="index.php?view=help"><span class="nav-icon"><?= icon('help') ?></span><span>Centro de ayuda</span></a>
+                <?php if (!$isCustomer): ?>
+                    <a class="nav-link <?= $view === 'settings' ? 'active' : '' ?>" href="index.php?view=settings"><span class="nav-icon"><?= icon('settings') ?></span><span>Configuración</span></a>
+                    <a class="nav-link <?= $view === 'help' ? 'active' : '' ?>" href="index.php?view=help"><span class="nav-icon"><?= icon('help') ?></span><span>Centro de ayuda</span></a>
+                <?php endif; ?>
                 <a class="profile-link" href="index.php?view=<?= isset($_SESSION['user_id']) ? 'logout' : 'login' ?>"><span class="avatar avatar-small"><?= h(initials((string) ($_SESSION['user_name'] ?? 'Marina López'))) ?></span><span><strong><?= h($_SESSION['user_name'] ?? 'Marina López') ?></strong><small><?= h($_SESSION['user_role'] ?? 'Vista previa') ?></small></span><span class="profile-arrow"><?= isset($_SESSION['user_id']) ? '↗' : '→' ?></span></a>
             </div>
         </aside>
@@ -514,7 +588,7 @@ $maxServiceRevenue = max(1, ...array_map(static function ($service) {
                     <div class="tabs appointment-tabs"><a class="tab active" href="#todas" data-appointment-status="">Todas las citas (<?= count($appointments) ?>)</a><a class="tab" href="#confirmadas" data-appointment-status="Confirmada">Confirmadas</a><a class="tab" href="#pendientes" data-appointment-status="Pendiente">Pendientes</a><a class="tab" href="index.php?view=offline">Modo sin conexión</a></div>
                     <section class="section-card filters">
                         <label class="search-field">Buscar cita<input data-filter="appointment" type="search" placeholder="Nombre, teléfono o referencia"></label>
-                        <label>Fecha<input type="date" value="<?= h($today) ?>" id="agenda-date"></label>
+                        <label>Fecha (vacía = todas)<input type="date" value="" id="agenda-date"></label>
                         <label>Barbero<select id="barber-filter"><option value="">Todo el equipo</option><?php foreach ($barbers as $barber): ?><option><?= h($barber['nombre']) ?></option><?php endforeach; ?></select></label>
                         <a class="button button-primary" href="index.php?view=appointment-new">＋ Nueva cita</a>
                     </section>
@@ -528,7 +602,13 @@ $maxServiceRevenue = max(1, ...array_map(static function ($service) {
                                 <td><?= h($appointment['barbero']) ?></td><td><?= h(pesos($appointment['total'])) ?></td>
                                 <td><span class="status status-<?= h(strtolower($appointment['estado_cita'])) ?>"><?= h($appointment['estado_cita']) ?></span></td>
                                 <td>
-                                    <?php if ($appointment['estado_cita'] !== 'Completada' && $appointment['estado_cita'] !== 'Cancelada'): ?>
+                                    <?php if ($isCustomer && !in_array($appointment['estado_cita'], ['Completada', 'Cancelada'], true)): ?>
+                                        <?php if (strtotime($appointment['fecha_hora']) > time() + 48 * 60 * 60): ?>
+                                            <form method="post" class="inline-form" data-confirm="¿Cancelar esta cita?"><input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>"><input type="hidden" name="action" value="cancel-customer-appointment"><input type="hidden" name="id_cita" value="<?= (int) $appointment['id_cita'] ?>"><button class="text-button text-button-danger" type="submit">Cancelar</button></form>
+                                        <?php else: ?>
+                                            <span class="muted">No cancelable (menos de 48 h)</span>
+                                        <?php endif; ?>
+                                    <?php elseif (!$isCustomer && $appointment['estado_cita'] !== 'Completada' && $appointment['estado_cita'] !== 'Cancelada'): ?>
                                         <form method="post" class="inline-form"><input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>"><input type="hidden" name="action" value="update-appointment"><input type="hidden" name="id_cita" value="<?= (int) $appointment['id_cita'] ?>"><input type="hidden" name="estado_cita" value="<?= $appointment['estado_cita'] === 'Pendiente' ? 'Confirmada' : 'Completada' ?>"><button class="text-button" type="submit"><?= $appointment['estado_cita'] === 'Pendiente' ? 'Confirmar' : 'Completar' ?></button></form>
                                         <form method="post" class="inline-form" data-confirm="¿Cancelar esta cita? Se liberará el horario."><input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>"><input type="hidden" name="action" value="update-appointment"><input type="hidden" name="id_cita" value="<?= (int) $appointment['id_cita'] ?>"><input type="hidden" name="estado_cita" value="Cancelada"><button class="text-button text-button-danger" type="submit">Cancelar</button></form>
                                     <?php else: ?><span class="muted">—</span><?php endif; ?>
@@ -545,16 +625,40 @@ $maxServiceRevenue = max(1, ...array_map(static function ($service) {
                     <form class="booking-form" method="post">
                         <input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>"><input type="hidden" name="action" value="create-appointment">
                         <section class="section-card form-section"><div class="section-head"><h2>Datos de la visita</h2><small>* Obligatorios</small></div>
-                            <label>Cliente *<select name="id_cliente" required><option value="">Selecciona un cliente</option><?php foreach ($clients as $client): ?><option value="<?= (int) $client['id_usuario'] ?>" <?= $selectedClientId === (int) $client['id_usuario'] ? 'selected' : '' ?>><?= h($client['nombre']) ?> · <?= h($client['telefono']) ?></option><?php endforeach; ?></select></label>
-                            <a class="small-link" href="index.php?view=clients">＋ Registrar un nuevo cliente</a>
-                            <label>Servicio *<select name="id_servicio" required><option value="">Selecciona un servicio</option><?php foreach ($services as $service): if ($service['estado'] !== 'Activo') { continue; } ?><option value="<?= (int) $service['id_servicio'] ?>"><?= h($service['nombre_servicio']) ?> · <?= (int) $service['duracion_minutos'] ?> min · <?= h(pesos($service['precio'])) ?></option><?php endforeach; ?></select></label>
-                            <label>Barbero *<select name="id_barbero" required><option value="">Selecciona un barbero</option><?php foreach ($barbers as $barber): if ($barber['estado'] !== 'Activo') { continue; } ?><option value="<?= (int) $barber['id_barbero'] ?>"><?= h($barber['nombre']) ?></option><?php endforeach; ?></select></label>
+                                        <?php if ($isCustomer): ?>
+                                            <label>Cliente<input value="<?= h($_SESSION['user_name'] ?? '') ?>" readonly></label>
+                                        <?php else: ?>
+                                            <label>Cliente *<select name="id_cliente" required><option value="">Selecciona un cliente</option><?php foreach ($clients as $client): ?><option value="<?= (int) $client['id_usuario'] ?>" <?= $selectedClientId === (int) $client['id_usuario'] ? 'selected' : '' ?>><?= h($client['nombre']) ?> · <?= h($client['telefono']) ?></option><?php endforeach; ?></select></label>
+                                            <a class="small-link" href="index.php?view=clients">＋ Registrar un nuevo cliente</a>
+                                        <?php endif; ?>
+                            <label>Servicio *<select id="booking-service" name="id_servicio" required><option value="">Selecciona un servicio</option><?php foreach ($services as $service): if ($service['estado'] !== 'Activo') { continue; } ?><option value="<?= (int) $service['id_servicio'] ?>" data-duration="<?= (int) $service['duracion_minutos'] ?>"><?= h($service['nombre_servicio']) ?> · <?= (int) $service['duracion_minutos'] ?> min · <?= h(pesos($service['precio'])) ?></option><?php endforeach; ?></select></label>
+                            <label>Barbero *<select id="booking-barber" name="id_barbero" required><option value="">Selecciona un barbero</option><?php foreach ($barbers as $barber): if ($barber['estado'] !== 'Activo') { continue; } ?><option value="<?= (int) $barber['id_barbero'] ?>"><?= h($barber['nombre']) ?></option><?php endforeach; ?></select></label>
                         </section>
                         <section class="section-card form-section"><div class="section-head"><h2>Fecha y horario</h2><small>Hora local · Bogotá</small></div>
-                            <label>Fecha y hora *<input type="datetime-local" name="fecha_hora" min="<?= h(date('Y-m-d\TH:i')) ?>" required></label>
-                            <p class="muted">Comprobaremos que el barbero esté libre antes de guardar la cita.</p>
+                            <div class="booking-schedule">
+                                <label class="booking-date-label" for="booking-date">Elige el día
+                                    <input id="booking-date" type="date" name="booking_date" min="<?= h($today) ?>" data-now="<?= h(date('Y-m-d\TH:i')) ?>" required>
+                                </label>
+                                <fieldset class="time-slot-group">
+                                    <legend>Elige la hora</legend>
+                                    <div class="time-slot-grid">
+                                        <?php for ($hour = 9; $hour <= 17; $hour++): ?>
+                                            <?php $time = sprintf('%02d:00', $hour); $slotId = 'booking-time-' . $hour; ?>
+                                            <label class="time-slot" for="<?= h($slotId) ?>">
+                                                <input id="<?= h($slotId) ?>" type="radio" name="booking_time" value="<?= h($time) ?>" required>
+                                                <span><?= h(date('g:i', strtotime($time))) ?><?= $hour < 12 ? ' a. m.' : ' p. m.' ?></span>
+                                            </label>
+                                        <?php endfor; ?>
+                                    </div>
+                                </fieldset>
+                                <input type="hidden" name="fecha_hora" id="booking-datetime">
+                            </div>
+                            <p class="muted" id="booking-availability-message" aria-live="polite">Selecciona servicio, barbero y fecha para consultar los horarios.</p>
+                            <script type="application/json" id="booking-availability"><?= json_encode($bookingAvailability, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?></script>
+                            <p class="muted">Horario disponible: de 9:00 a. m. a 5:00 p. m. La cita debe terminar antes de las 6:00 p. m.</p>
+                            <noscript><p class="notice notice-warning">Activa JavaScript para seleccionar el día y la hora de la cita.</p></noscript>
                         </section>
-                        <div class="form-actions"><a class="button button-secondary" href="index.php?view=agenda">Cancelar</a><button class="button button-primary" type="submit">Guardar cita →</button></div>
+                        <div class="form-actions"><a class="button button-secondary" href="index.php?view=agenda">Cancelar</a><button id="booking-submit" class="button button-primary" type="submit">Guardar cita →</button></div>
                     </form>
 
                 <?php elseif ($view === 'clients'): ?>

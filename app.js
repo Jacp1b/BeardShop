@@ -75,4 +75,68 @@
         });
     });
     filterAppointments();
+
+    const bookingForm = document.querySelector('.booking-form');
+    const bookingDate = document.querySelector('#booking-date');
+    const bookingDateTime = document.querySelector('#booking-datetime');
+    const bookingBarber = document.querySelector('#booking-barber');
+    const bookingService = document.querySelector('#booking-service');
+    const bookingSubmit = document.querySelector('#booking-submit');
+    const availabilityElement = document.querySelector('#booking-availability');
+    const availabilityMessage = document.querySelector('#booking-availability-message');
+    const existingAppointments = availabilityElement ? JSON.parse(availabilityElement.textContent) : [];
+    const bookingSlots = [...document.querySelectorAll('input[name="booking_time"]')];
+    const updateBookingDateTime = () => {
+        const date = bookingDate.value;
+        const barberId = bookingBarber.value;
+        const selectedService = bookingService.selectedOptions[0];
+        const serviceDuration = Number(selectedService?.dataset.duration || 0);
+        const hasBookingDetails = Boolean(date && barberId && serviceDuration);
+        let availableCount = 0;
+
+        bookingSlots.forEach((slot) => {
+            const slotStart = Number(slot.value.slice(0, 2)) * 60;
+            const slotEnd = slotStart + serviceDuration;
+            const slotDateTime = `${date}T${slot.value}`;
+            const isPast = date === bookingDate.dataset.now.slice(0, 10)
+                && slotDateTime <= bookingDate.dataset.now;
+            const hasConflict = hasBookingDetails && existingAppointments.some((appointment) => {
+                if (
+                    String(appointment.id_barbero) !== barberId ||
+                    appointment.fecha_hora.slice(0, 10) !== date
+                ) {
+                    return false;
+                }
+                const appointmentStart = appointment.fecha_hora.slice(11, 16);
+                const appointmentStartMinutes = Number(appointmentStart.slice(0, 2)) * 60
+                    + Number(appointmentStart.slice(3, 5));
+                const appointmentEndMinutes = appointmentStartMinutes + Number(appointment.duracion);
+                return slotStart < appointmentEndMinutes && slotEnd > appointmentStartMinutes;
+            });
+            slot.disabled = !hasBookingDetails || isPast || hasConflict;
+            if (!slot.disabled) availableCount += 1;
+            if (slot.disabled && slot.checked) slot.checked = false;
+        });
+
+        const availableSlot = bookingSlots.find((slot) => slot.checked);
+        bookingDateTime.value = date && availableSlot ? `${date}T${availableSlot.value}` : '';
+        if (bookingSubmit) {
+            bookingSubmit.disabled = hasBookingDetails && availableCount === 0;
+        }
+        if (availabilityMessage) {
+            availabilityMessage.textContent = !hasBookingDetails
+                ? 'Selecciona servicio, barbero y fecha para consultar los horarios.'
+                : availableCount
+                    ? 'Las horas ocupadas o que se cruzan con otra cita están deshabilitadas.'
+                    : 'No hay horas disponibles para este día. Elige otra fecha o barbero.';
+        }
+    };
+    if (bookingForm && bookingDate && bookingDateTime && bookingBarber && bookingService) {
+        bookingDate.addEventListener('change', updateBookingDateTime);
+        bookingBarber.addEventListener('change', updateBookingDateTime);
+        bookingService.addEventListener('change', updateBookingDateTime);
+        bookingSlots.forEach((slot) => slot.addEventListener('change', updateBookingDateTime));
+        bookingForm.addEventListener('submit', updateBookingDateTime);
+        updateBookingDateTime();
+    }
 })();

@@ -16,6 +16,8 @@ Panel web responsive para la gestión de la barbería, inspirado en el prototipo
 
 La conexión PDO está en `CONEXION.php`. Las credenciales no se deben guardar en el repositorio; utiliza variables de entorno para instalaciones compartidas. Si la base de datos no está disponible, el panel muestra una vista previa claramente identificada y no guarda los formularios.
 
-El acceso de administración acepta cuentas con rol `Administrador` o `Barbero`; las contraseñas deben guardarse con `password_hash()`. La cuenta del archivo de datos de prueba puede iniciar sesión con `admin@barbershop.com` y la contraseña `password`.
+El acceso acepta cuentas con rol `Administrador`, `Barbero` o `Cliente`; las contraseñas deben guardarse con `password_hash()`. Las cuentas de clientes solo pueden consultar sus propias citas y reservar nuevas, mientras que la gestión de la barbería queda reservada al personal. La cuenta del archivo de datos de prueba puede iniciar sesión con `admin@barbershop.com` y la contraseña `password`; los clientes de prueba usan la misma contraseña.
+
+La agenda muestra todas las citas si el filtro de fecha está vacío. Las citas se reservan en horas exactas, con inicio entre las 9:00 a. m. y las 5:00 p. m., y deben terminar antes de las 6:00 p. m. Los clientes pueden cancelar sus propias citas con más de 48 horas de anticipación.
 
 `database/schema.sql` es seguro para una instalación nueva y no elimina bases existentes. La migración agrega únicamente los campos necesarios a una instalación previa.
